@@ -10,6 +10,14 @@ html {
   --select-option-focused-bgc: #{$colorInfo};
   --select-option-focused-color: #{$textColorAccent};
 
+  .Notifications {
+    .Select {
+      &__control {
+        border: solid 1px;
+      }
+    }
+  }
+
   .Select {
     position: relative;
     min-width: 220px;

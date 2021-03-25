@@ -72,3 +72,9 @@
     box-shadow: none !important;
   }
 }
+
+.NotificationSelect {
+  &.Select__menu {
+    z-index: 100001;
+  }
+}

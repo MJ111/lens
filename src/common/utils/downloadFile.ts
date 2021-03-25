@@ -1,7 +1,8 @@
 import request from "request";
+import URLParse from "url-parse";
 
 export interface DownloadFileOptions {
-  url: string;
+  url: string | URLParse;
   gzip?: boolean;
   timeout?: number;
 }
@@ -13,6 +14,8 @@ export interface DownloadFileTicket {
 }
 
 export function downloadFile({ url, timeout, gzip = true }: DownloadFileOptions): DownloadFileTicket {
+  url = url.toString();
+
   const fileChunks: Buffer[] = [];
   const req = request(url, { gzip, timeout });
   const promise: Promise<Buffer> = new Promise((resolve, reject) => {

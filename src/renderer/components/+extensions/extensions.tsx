@@ -23,18 +23,18 @@ import { Notifications } from "../notifications";
 import { Spinner } from "../spinner/spinner";
 import { TooltipPosition } from "../tooltip";
 import { ExtensionInstallationState, ExtensionInstallationStateStore } from "./extension-install.store";
+import URLParse from "url-parse";
+import { Select, SelectOption } from "../select";
+import { SemVer } from "semver";
 
 interface InstallRequest {
   fileName: string;
-  filePath?: string;
-  data?: Buffer;
+  dataP: Promise<Buffer>;
 }
 
-interface InstallRequestPreloaded extends InstallRequest {
+interface InstallRequestValidated {
+  fileName: string;
   data: Buffer;
-}
-
-interface InstallRequestValidated extends InstallRequestPreloaded {
   id: LensExtensionId;
   manifest: LensExtensionManifest;
   tempFile: string; // temp system path to packed extension for unpacking
@@ -91,16 +91,10 @@ function getExtensionPackageTemp(fileName = "") {
   return path.join(os.tmpdir(), "lens-extensions", fileName);
 }
 
-async function preloadExtension({ fileName, data, filePath }: InstallRequest, { showError = true } = {}): Promise<InstallRequestPreloaded | null> {
-  if(data) {
-    return { filePath, data, fileName };
-  }
-
+async function readFileNotify(filePath: string, showError = true): Promise<Buffer | null> {
   try {
-    const data = await fse.readFile(filePath);
-
-    return { filePath, data, fileName };
-  } catch(error) {
+    return await fse.readFile(filePath);
+  } catch (error) {
     if (showError) {
       Notifications.error(`Error while reading "${filePath}": ${String(error)}`);
     }
@@ -115,7 +109,7 @@ async function validatePackage(filePath: string): Promise<LensExtensionManifest>
   // tarball from npm contains single root folder "package/*"
   const firstFile = tarFiles[0];
 
-  if(!firstFile) {
+  if (!firstFile) {
     throw new Error(`invalid extension bundle,  ${manifestFilename} not found`);
   }
 
@@ -123,7 +117,7 @@ async function validatePackage(filePath: string): Promise<LensExtensionManifest>
   const packedInRootFolder = tarFiles.every(entry => entry.startsWith(rootFolder));
   const manifestLocation = packedInRootFolder ? path.join(rootFolder, manifestFilename) : manifestFilename;
 
-  if(!tarFiles.includes(manifestLocation)) {
+  if (!tarFiles.includes(manifestLocation)) {
     throw new Error(`invalid extension bundle, ${manifestFilename} not found`);
   }
 
@@ -140,20 +134,27 @@ async function validatePackage(filePath: string): Promise<LensExtensionManifest>
   return manifest;
 }
 
-async function createTempFilesAndValidate(request: InstallRequestPreloaded, { showErrors = true } = {}): Promise<InstallRequestValidated | null> {
+async function createTempFilesAndValidate({ fileName, dataP }: InstallRequest, { showErrors = true } = {}): Promise<InstallRequestValidated | null> {
   // copy files to temp
   await fse.ensureDir(getExtensionPackageTemp());
 
   // validate packages
-  const tempFile = getExtensionPackageTemp(request.fileName);
+  const tempFile = getExtensionPackageTemp(fileName);
 
   try {
-    await fse.writeFile(tempFile, request.data);
+    const data = await dataP;
+
+    if (!data) {
+      return;
+    }
+
+    await fse.writeFile(tempFile, data);
     const manifest = await validatePackage(tempFile);
     const id = path.join(extensionDiscovery.nodeModulesPath, manifest.name, "package.json");
 
     return {
-      ...request,
+      fileName,
+      data,
       manifest,
       tempFile,
       id,
@@ -164,7 +165,7 @@ async function createTempFilesAndValidate(request: InstallRequestPreloaded, { sh
     if (showErrors) {
       Notifications.error(
         <div className="flex column gaps">
-          <p>Installing <em>{request.fileName}</em> has failed, skipping.</p>
+          <p>Installing <em>{fileName}</em> has failed, skipping.</p>
           <p>Reason: <em>{String(error)}</em></p>
         </div>
       );
@@ -235,13 +236,7 @@ async function unpackExtension(request: InstallRequestValidated, disposeDownload
  */
 async function requestInstall(request: InstallRequest, d?: Disposer): Promise<void> {
   const dispose = disposer(ExtensionInstallationStateStore.startPreInstall(), d);
-  const loadedRequest = await preloadExtension(request);
-
-  if (!loadedRequest) {
-    return dispose();
-  }
-
-  const validatedRequest = await createTempFilesAndValidate(loadedRequest);
+  const validatedRequest = await createTempFilesAndValidate(request);
 
   if (!validatedRequest) {
     return dispose();
@@ -304,7 +299,7 @@ async function requestInstalls(filePaths: string[]): Promise<void> {
   for (const filePath of filePaths) {
     promises.push(requestInstall({
       fileName: path.basename(filePath),
-      filePath,
+      dataP: readFileNotify(filePath),
     }));
   }
 
@@ -316,6 +311,54 @@ async function installOnDrop(files: File[]) {
   await requestInstalls(files.map(({ path }) => path));
 }
 
+async function requestInstallVersion(url: URLParse): Promise<string | null> {
+  const disposer = ExtensionInstallationStateStore.startPreInstall();
+  let json: Record<string, any>;
+
+  try {
+    const ticket = downloadFile({ url, gzip: false, timeout: 60_000 });
+    const res = await ticket.promise;
+
+    json = JSON.parse(res.toString());
+  } catch (error) {
+    console.error(error);
+    Notifications.error("Failed to get registry information for that extension");
+    disposer();
+
+    return null;
+  }
+
+  let selected: string;
+  const options = Object.keys(json.versions)
+    .map(version => new SemVer(version, { loose: true, includePrerelease: true }))
+    .sort((a, b) => b.compare(a))
+    .map(a => a.format());
+
+  const removeNotification = Notifications.info(
+    <div className="InstallingExtensionNotification flex gaps align-center">
+      <div className="flex column gaps">
+        <p>Install extension <b>{json.name}</b>?</p>
+        <p>Description: <em>{json.description}</em></p>
+        <Select
+          menuClass="NotificationSelect"
+          options={options}
+          placeholder="Select version to install"
+          onChange={(selection: SelectOption<string>) => selected = selection.value}
+        />
+      </div>
+      <Button autoFocus label="Install" onClick={async () => {
+        removeNotification();
+
+        const url = json.versions[selected].dist.tarball;
+        const fileName = path.basename(url);
+        const { promise: dataP } = downloadFile({ url, timeout: 60000 /*1m*/ });
+
+        await requestInstall({ fileName, dataP }, disposer);
+      }} />
+    </div>
+  );
+}
+
 async function installFromUrlOrPath(installPath: string) {
   const fileName = path.basename(installPath);
 
@@ -323,15 +366,22 @@ async function installFromUrlOrPath(installPath: string) {
     // install via url
     // fixme: improve error messages for non-tar-file URLs
     if (InputValidators.isUrl.validate(installPath)) {
-      const disposer = ExtensionInstallationStateStore.startPreInstall();
-      const { promise: filePromise } = downloadFile({ url: installPath, timeout: 60000 /*1m*/ });
-      const data = await filePromise;
+      const url = new URLParse(installPath);
 
-      await requestInstall({ fileName, data }, disposer);
+      if (url.hostname === "registry.npmjs.com") {
+        await requestInstallVersion(url);
+      } else {
+        // assume a non registry URL points to a tarball
+
+        const disposer = ExtensionInstallationStateStore.startPreInstall();
+        const { promise: dataP } = downloadFile({ url, timeout: 60000 /*1m*/ });
+
+        await requestInstall({ fileName, dataP }, disposer);
+      }
     }
     // otherwise installing from system path
     else if (InputValidators.isPath.validate(installPath)) {
-      await requestInstall({ fileName, filePath: installPath });
+      await requestInstall({ fileName, dataP: readFileNotify(installPath) });
     }
   } catch (error) {
     Notifications.error(
